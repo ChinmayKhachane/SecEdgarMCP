@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -24,6 +25,7 @@ type Client struct {
 	httpClient *http.Client
 	userAgent  string
 	cache      *TickerCache
+	logger     *log.Logger
 }
 
 // NewClient creates a new EDGAR API client.
@@ -36,7 +38,19 @@ func NewClient(userAgent string) *Client {
 	}
 }
 
+// SetLogger attaches a file logger to the client for request logging.
+func (c *Client) SetLogger(l *log.Logger) {
+	c.logger = l
+}
+
+func (c *Client) logf(format string, args ...any) {
+	if c.logger != nil {
+		c.logger.Printf(format, args...)
+	}
+}
+
 func (c *Client) get(rawURL string) ([]byte, error) {
+	start := time.Now()
 	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
 		return nil, err
@@ -46,18 +60,23 @@ func (c *Client) get(rawURL string) ([]byte, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		c.logf("GET %s  error: %v (%s)", rawURL, err, time.Since(start))
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	body, readErr := io.ReadAll(resp.Body)
+	c.logf("GET %s  %d (%s)", rawURL, resp.StatusCode, time.Since(start))
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("SEC API returned status %d for %s", resp.StatusCode, rawURL)
 	}
 
-	return io.ReadAll(resp.Body)
+	return body, readErr
 }
 
 func (c *Client) getHTML(rawURL string) ([]byte, error) {
+	start := time.Now()
 	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
 		return nil, err
@@ -67,15 +86,19 @@ func (c *Client) getHTML(rawURL string) ([]byte, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		c.logf("GET %s  error: %v (%s)", rawURL, err, time.Since(start))
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	body, readErr := io.ReadAll(resp.Body)
+	c.logf("GET %s  %d (%s)", rawURL, resp.StatusCode, time.Since(start))
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("SEC returned status %d for %s", resp.StatusCode, rawURL)
 	}
 
-	return io.ReadAll(resp.Body)
+	return body, readErr
 }
 
 // PadCIK pads a CIK to 10 digits with leading zeros.
@@ -338,8 +361,17 @@ func BuildSECURL(cik, accessionNumber string) string {
 	return fmt.Sprintf("%s/%s/%s/%s-index.htm", archivesBaseURL, trimCIK, cleanAcc, accessionNumber)
 }
 
-// GetLatestMetricValue returns the most recent data point for a given metric from company facts.
-func GetLatestMetricValue(facts *CompanyFactsResponse, namespace, concept string) *FactDataPoint {
+// GetLatestMetricValue returns the most recent data point for a given metric.
+// formFilter controls which filing types are considered:
+//   - ""           → both 10-K and 10-Q (latest of either)
+//   - "10-K"       → annual only
+//   - "10-Q"       → quarterly only
+//
+// When multiple data points share the same end date (common in 10-Q filings
+// which report both quarterly and year-to-date figures), the shortest period
+// is preferred so that a 3-month figure is returned instead of a 6- or
+// 9-month cumulative.
+func GetLatestMetricValue(facts *CompanyFactsResponse, namespace, concept, formFilter string) *FactDataPoint {
 	ns, ok := facts.Facts[namespace]
 	if !ok {
 		return nil
@@ -349,18 +381,34 @@ func GetLatestMetricValue(facts *CompanyFactsResponse, namespace, concept string
 		return nil
 	}
 
-	// Look through all units and find the most recent 10-K or 10-Q filing.
 	var best *FactDataPoint
 	for _, points := range fd.Units {
 		for i := range points {
 			p := &points[i]
-			if p.Form != "10-K" && p.Form != "10-Q" {
+			if formFilter != "" {
+				if p.Form != formFilter {
+					continue
+				}
+			} else if p.Form != "10-K" && p.Form != "10-Q" {
 				continue
 			}
-			if best == nil || p.End > best.End {
+			if best == nil || p.End > best.End || (p.End == best.End && IsShorterPeriod(p, best)) {
 				best = p
 			}
 		}
 	}
 	return best
+}
+
+// isShorterPeriod returns true if a has a shorter reporting period than b.
+// For flow metrics (income statement, cash flow) 10-Q filings include both
+// quarterly (3-month) and year-to-date (6/9-month) figures with the same end
+// date. The quarterly figure has a later Start date (shorter duration).
+// Point-in-time metrics (balance sheet) have no Start date and are unaffected.
+func IsShorterPeriod(a, b *FactDataPoint) bool {
+	if a.Start == "" || b.Start == "" {
+		return false
+	}
+	// Later start = shorter period for the same end date.
+	return a.Start > b.Start
 }

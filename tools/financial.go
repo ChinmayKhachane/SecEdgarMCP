@@ -102,6 +102,7 @@ func RegisterFinancialTools(s *server.MCPServer, client *edgar.Client) {
 		mcp.NewTool("get_key_metrics",
 			mcp.WithDescription("Get key financial metrics (Revenue, Net Income, Assets, EPS, etc.) from XBRL company facts"),
 			mcp.WithString("identifier", mcp.Required(), mcp.Description("Stock ticker or CIK number")),
+			mcp.WithString("period", mcp.Description("Period type: annual (10-K only), quarterly (10-Q only), or latest (most recent of either, default)")),
 		),
 		WithTiming("get_key_metrics", getKeyMetrics(client)),
 	)
@@ -198,11 +199,12 @@ func resolveConceptAlternatives(concept string) []string {
 
 // bestAlternative fetches all alternative concepts and returns the data point
 // with the most recent end date along with the concept name that matched.
-func bestAlternative(facts *edgar.CompanyFactsResponse, namespace string, alternatives []string) (*edgar.FactDataPoint, string) {
+// formFilter is passed to GetLatestMetricValue ("", "10-K", or "10-Q").
+func bestAlternative(facts *edgar.CompanyFactsResponse, namespace string, alternatives []string, formFilter string) (*edgar.FactDataPoint, string) {
 	var best *edgar.FactDataPoint
 	bestConcept := ""
 	for _, alt := range alternatives {
-		dp := edgar.GetLatestMetricValue(facts, namespace, alt)
+		dp := edgar.GetLatestMetricValue(facts, namespace, alt, formFilter)
 		if dp != nil && (best == nil || dp.End > best.End) {
 			best = dp
 			bestConcept = alt
@@ -215,7 +217,7 @@ func extractConceptValues(facts *edgar.CompanyFactsResponse, concepts []string) 
 	result := make(map[string]any)
 	for _, concept := range concepts {
 		alts := resolveConceptAlternatives(concept)
-		dp, matched := bestAlternative(facts, "us-gaap", alts)
+		dp, matched := bestAlternative(facts, "us-gaap", alts, "")
 		if dp != nil {
 			result[concept] = map[string]any{
 				"value":         dp.Val,
@@ -233,6 +235,18 @@ func extractConceptValues(facts *edgar.CompanyFactsResponse, concepts []string) 
 func getKeyMetrics(client *edgar.Client) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		identifier, _ := req.RequireString("identifier")
+		period := req.GetString("period", "latest")
+
+		var formFilter string
+		switch period {
+		case "annual":
+			formFilter = "10-K"
+		case "quarterly":
+			formFilter = "10-Q"
+		default:
+			formFilter = ""
+			period = "latest"
+		}
 
 		cik, err := client.ResolveCIK(identifier)
 		if err != nil {
@@ -248,7 +262,7 @@ func getKeyMetrics(client *edgar.Client) server.ToolHandlerFunc {
 		found := 0
 		for _, concept := range defaultKeyMetrics {
 			alts := resolveConceptAlternatives(concept)
-			best, bestConcept := bestAlternative(facts, "us-gaap", alts)
+			best, bestConcept := bestAlternative(facts, "us-gaap", alts, formFilter)
 			if best != nil {
 				metrics[concept] = map[string]any{
 					"value":         best.Val,
@@ -266,6 +280,7 @@ func getKeyMetrics(client *edgar.Client) server.ToolHandlerFunc {
 			"success":           true,
 			"cik":               cik,
 			"name":              facts.EntityName,
+			"period":            period,
 			"metrics":           metrics,
 			"requested_metrics": defaultKeyMetrics,
 			"found_metrics":     found,
@@ -605,6 +620,8 @@ func discoverXBRLConcepts(client *edgar.Client) server.ToolHandlerFunc {
 }
 
 // getLatestByForm returns the latest data point for a concept filtered by form type.
+// When multiple points share the same end date, the shortest period is preferred
+// (quarterly over year-to-date for 10-Q filings).
 func getLatestByForm(facts *edgar.CompanyFactsResponse, namespace, concept, formType string) *edgar.FactDataPoint {
 	ns, ok := facts.Facts[namespace]
 	if !ok {
@@ -621,7 +638,7 @@ func getLatestByForm(facts *edgar.CompanyFactsResponse, namespace, concept, form
 			if !strings.EqualFold(p.Form, formType) {
 				continue
 			}
-			if best == nil || p.End > best.End {
+			if best == nil || p.End > best.End || (p.End == best.End && edgar.IsShorterPeriod(p, best)) {
 				best = p
 			}
 		}

@@ -26,6 +26,11 @@ func InitLogger(path string) (*os.File, error) {
 	return f, nil
 }
 
+// Logger returns the shared logger instance for use by other packages.
+func Logger() *log.Logger {
+	return toolLogger
+}
+
 // WithTiming wraps a tool handler and logs the total time it takes to execute.
 func WithTiming(name string, handler server.ToolHandlerFunc) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -153,7 +158,7 @@ func getCompanyFacts(client *edgar.Client) server.ToolHandlerFunc {
 		metrics := make(map[string]any)
 		for _, key := range metricKeys {
 			alts := resolveConceptAlternatives(key)
-			dp, matched := bestAlternative(facts, "us-gaap", alts)
+			dp, matched := bestAlternative(facts, "us-gaap", alts, "")
 			if dp != nil {
 				metrics[key] = map[string]any{
 					"value":         dp.Val,

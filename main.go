@@ -31,6 +31,9 @@ func main() {
 	}
 
 	client := edgar.NewClient(userAgent)
+	if l := tools.Logger(); l != nil {
+		client.SetLogger(l)
+	}
 
 	s := server.NewMCPServer(
 		"SEC EDGAR MCP",
