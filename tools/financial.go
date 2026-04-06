@@ -27,6 +27,10 @@ var conceptGroups = [][]string{
 	{"AccountsReceivableAllowanceForCreditLossExcludingAccruedInterest", "AllowanceForDoubtfulAccountsReceivableCurrent"},
 	// Debt taxonomy — companies vary on which tag they use
 	{"LongTermDebt", "LongTermDebtNoncurrent"},
+	// Cash change — old vs new tag
+	{"CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect", "CashAndCashEquivalentsPeriodIncreaseDecrease"},
+	// Debt repayment variants
+	{"RepaymentsOfDebtAndCapitalLeaseObligations", "RepaymentsOfDebt"},
 }
 
 // conceptGroupIndex maps each XBRL concept to its full group of alternatives.
@@ -68,10 +72,10 @@ var cashFlowConcepts = []string{
 	"NetCashProvidedByUsedInOperatingActivities",
 	"NetCashProvidedByUsedInInvestingActivities",
 	"NetCashProvidedByUsedInFinancingActivities",
-	"CashAndCashEquivalentsPeriodIncreaseDecrease",
+	"CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect",
 	"DepreciationDepletionAndAmortization",
 	"PaymentsToAcquirePropertyPlantAndEquipment",
-	"PaymentsOfDividends", "ProceedsFromIssuanceOfDebt", "RepaymentsOfDebt",
+	"PaymentsOfDividends", "ProceedsFromIssuanceOfDebt", "RepaymentsOfDebtAndCapitalLeaseObligations",
 }
 
 // defaultKeyMetrics maps a display name to one or more XBRL concept alternatives.
@@ -94,6 +98,7 @@ func RegisterFinancialTools(s *server.MCPServer, client *edgar.Client) {
 			mcp.WithDescription("Extract income statement, balance sheet, and/or cash flow data from a company's latest 10-K or 10-Q filing"),
 			mcp.WithString("identifier", mcp.Required(), mcp.Description("Stock ticker or CIK number")),
 			mcp.WithString("statement_type", mcp.Description("Type of statement: income, balance, cash, or all (default: all)")),
+			mcp.WithString("period", mcp.Description("Period type: annual (10-K only), quarterly (10-Q only), or latest (most recent of either, default). Applies to income statement and cash flow only; balance sheet always returns the latest snapshot.")),
 		),
 		WithTiming("get_financials", getFinancials(client)),
 	)
@@ -154,6 +159,18 @@ func getFinancials(client *edgar.Client) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		identifier, _ := req.RequireString("identifier")
 		stmtType := req.GetString("statement_type", "all")
+		period := req.GetString("period", "latest")
+
+		var formFilter string
+		switch period {
+		case "annual":
+			formFilter = "10-K"
+		case "quarterly":
+			formFilter = "10-Q"
+		default:
+			formFilter = ""
+			period = "latest"
+		}
 
 		cik, err := client.ResolveCIK(identifier)
 		if err != nil {
@@ -168,19 +185,21 @@ func getFinancials(client *edgar.Client) server.ToolHandlerFunc {
 		statements := make(map[string]any)
 
 		if stmtType == "all" || stmtType == "income" {
-			statements["income_statement"] = extractConceptValues(facts, incomeStatementConcepts)
+			statements["income_statement"] = extractConceptValues(facts, incomeStatementConcepts, formFilter)
 		}
 		if stmtType == "all" || stmtType == "balance" {
-			statements["balance_sheet"] = extractConceptValues(facts, balanceSheetConcepts)
+			// Balance sheet is a point-in-time snapshot; always return the latest.
+			statements["balance_sheet"] = extractConceptValues(facts, balanceSheetConcepts, "")
 		}
 		if stmtType == "all" || stmtType == "cash" {
-			statements["cash_flow"] = extractConceptValues(facts, cashFlowConcepts)
+			statements["cash_flow"] = extractConceptValues(facts, cashFlowConcepts, formFilter)
 		}
 
 		return jsonResult(map[string]any{
 			"success":    true,
 			"cik":        cik,
 			"name":       facts.EntityName,
+			"period":     period,
 			"statements": statements,
 		})
 	}
@@ -213,11 +232,11 @@ func bestAlternative(facts *edgar.CompanyFactsResponse, namespace string, altern
 	return best, bestConcept
 }
 
-func extractConceptValues(facts *edgar.CompanyFactsResponse, concepts []string) map[string]any {
+func extractConceptValues(facts *edgar.CompanyFactsResponse, concepts []string, formFilter string) map[string]any {
 	result := make(map[string]any)
 	for _, concept := range concepts {
 		alts := resolveConceptAlternatives(concept)
-		dp, matched := bestAlternative(facts, "us-gaap", alts, "")
+		dp, matched := bestAlternative(facts, "us-gaap", alts, formFilter)
 		if dp != nil {
 			result[concept] = map[string]any{
 				"value":         dp.Val,
