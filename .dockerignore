@@ -1,0 +1,8 @@
+*.log
+.git
+.mcp.json
+README.md
+LICENSE
+Dockerfile
+.dockerignore
+run.sh

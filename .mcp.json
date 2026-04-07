@@ -1,12 +1,10 @@
 {
   "mcpServers": {
     "sec-edgar": {
-      "command": "go",
-      "args": ["run", "."],
-      "cwd": "/home/chinmay/projects/secEdgarMCP",
-      "env": {
-        "SEC_EDGAR_USER_AGENT": "Chinmay LastName (your@email.com)"
-      }
+      "command": "docker",
+      "args": ["run", "--rm", "-i", "--platform", "linux/amd64",
+               "-e", "SEC_EDGAR_USER_AGENT=Chinmay LastName (your@email.com)",
+               "sec-edgar-mcp:latest"]
     }
   }
 }
