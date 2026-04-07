@@ -114,13 +114,25 @@ func RegisterFinancialTools(s *server.MCPServer, client *edgar.Client) {
 
 	s.AddTool(
 		mcp.NewTool("compare_periods",
-			mcp.WithDescription("Compare a financial metric across fiscal years with growth calculations and CAGR"),
+			mcp.WithDescription("Compare a financial metric across periods with growth analysis. Supports annual YoY, same-quarter YoY, and sequential quarter comparisons."),
 			mcp.WithString("identifier", mcp.Required(), mcp.Description("Stock ticker or CIK number")),
 			mcp.WithString("metric", mcp.Required(), mcp.Description("XBRL concept name (e.g., Revenues, NetIncomeLoss, Assets)")),
 			mcp.WithNumber("start_year", mcp.Required(), mcp.Description("Start fiscal year")),
 			mcp.WithNumber("end_year", mcp.Required(), mcp.Description("End fiscal year")),
+			mcp.WithString("period", mcp.Description("Comparison mode: 'annual' (default) for YoY 10-K, 'quarterly' for same-quarter YoY across years, 'sequential' for consecutive quarters within year range")),
+			mcp.WithString("quarter", mcp.Description("Quarter to compare when period=quarterly (Q1, Q2, Q3, Q4). Required for quarterly mode.")),
 		),
 		WithTiming("compare_periods", comparePeriods(client)),
+	)
+
+	s.AddTool(
+		mcp.NewTool("get_quarterly_distribution",
+			mcp.WithDescription("Show how income statement metrics distribute across quarters for one or more fiscal years. Shows each quarter's value and share of the annual total. Defaults to all income statement metrics if none specified."),
+			mcp.WithString("identifier", mcp.Required(), mcp.Description("Stock ticker or CIK number")),
+			mcp.WithString("years", mcp.Required(), mcp.Description("Comma-separated fiscal years (e.g. '2023,2024,2025')")),
+			mcp.WithString("metrics", mcp.Description("Comma-separated XBRL concept names (e.g. 'Revenues,NetIncomeLoss'). Defaults to all income statement metrics.")),
+		),
+		WithTiming("get_quarterly_distribution", getQuarterlyDistribution(client)),
 	)
 
 	s.AddTool(
@@ -307,12 +319,204 @@ func getKeyMetrics(client *edgar.Client) server.ToolHandlerFunc {
 	}
 }
 
+// periodDataPoint represents a single data point in a period comparison.
+type periodDataPoint struct {
+	FiscalYear   int     `json:"fiscal_year"`
+	FiscalPeriod string  `json:"fiscal_period"`
+	Value        float64 `json:"value"`
+	EndDate      string  `json:"end_date"`
+	Form         string  `json:"form"`
+}
+
+// periodKey uniquely identifies a period for deduplication.
+type periodKey struct {
+	Year   int
+	Period string
+}
+
+// collectMetricData gathers XBRL data points for a metric (with concept resolution)
+// filtered by form type, year range, and optional fiscal period.
+func collectMetricData(ns map[string]edgar.FactData, metric string, formTypes []string, startYear, endYear int, fiscalPeriod string, quarterlyOnly ...bool) []periodDataPoint {
+	filterQuarterly := len(quarterlyOnly) > 0 && quarterlyOnly[0]
+
+	alts := resolveConceptAlternatives(metric)
+	formSet := make(map[string]bool, len(formTypes))
+	for _, f := range formTypes {
+		formSet[f] = true
+	}
+
+	best := make(map[periodKey]*periodDataPoint)
+
+	for _, alt := range alts {
+		fd, ok := ns[alt]
+		if !ok {
+			continue
+		}
+		for _, points := range fd.Units {
+			for _, p := range points {
+				if !formSet[p.Form] {
+					continue
+				}
+				if p.FY < startYear || p.FY > endYear {
+					continue
+				}
+				if fiscalPeriod != "" && p.FP != fiscalPeriod {
+					continue
+				}
+				if filterQuarterly && p.Start != "" && p.End != "" {
+					start, err1 := edgar.ParseDate(p.Start)
+					end, err2 := edgar.ParseDate(p.End)
+					if err1 == nil && err2 == nil && int(end.Sub(start).Hours()/24) > 95 {
+						continue
+					}
+				}
+				key := periodKey{Year: p.FY, Period: p.FP}
+				if existing, ok := best[key]; !ok || p.End > existing.EndDate {
+					best[key] = &periodDataPoint{
+						FiscalYear:   p.FY,
+						FiscalPeriod: p.FP,
+						Value:        p.Val,
+						EndDate:      p.End,
+						Form:         p.Form,
+					}
+				}
+			}
+		}
+	}
+
+	result := make([]periodDataPoint, 0, len(best))
+	for _, dp := range best {
+		result = append(result, *dp)
+	}
+	return result
+}
+
+// sortPeriodData sorts data points chronologically (by year, then quarter).
+func sortPeriodData(data []periodDataPoint) {
+	quarterOrder := map[string]int{"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4, "FY": 5}
+	sort.Slice(data, func(i, j int) bool {
+		if data[i].FiscalYear != data[j].FiscalYear {
+			return data[i].FiscalYear < data[j].FiscalYear
+		}
+		return quarterOrder[data[i].FiscalPeriod] < quarterOrder[data[j].FiscalPeriod]
+	})
+}
+
+// computeGrowthAnalysis calculates period-over-period growth percentages,
+// total growth, and CAGR (for annual data) from sorted period data.
+func computeGrowthAnalysis(data []periodDataPoint) map[string]any {
+	analysis := map[string]any{}
+	if len(data) < 2 {
+		return analysis
+	}
+
+	// Period-over-period growth for each consecutive pair.
+	periodGrowth := make([]map[string]any, 0, len(data)-1)
+	for i := 1; i < len(data); i++ {
+		prev := data[i-1]
+		curr := data[i]
+		entry := map[string]any{
+			"from_period": fmt.Sprintf("%s %d", prev.FiscalPeriod, prev.FiscalYear),
+			"to_period":   fmt.Sprintf("%s %d", curr.FiscalPeriod, curr.FiscalYear),
+			"from_value":  prev.Value,
+			"to_value":    curr.Value,
+		}
+		if prev.Value != 0 {
+			pct := (curr.Value - prev.Value) / math.Abs(prev.Value) * 100
+			entry["change_percent"] = math.Round(pct*100) / 100
+			entry["change_absolute"] = curr.Value - prev.Value
+		}
+		periodGrowth = append(periodGrowth, entry)
+	}
+	analysis["period_growth"] = periodGrowth
+
+	// Overall growth from first to last.
+	startVal := data[0].Value
+	endVal := data[len(data)-1].Value
+	if startVal != 0 {
+		totalGrowth := (endVal - startVal) / math.Abs(startVal) * 100
+		analysis["total_growth_percent"] = math.Round(totalGrowth*100) / 100
+	}
+	analysis["start_value"] = startVal
+	analysis["end_value"] = endVal
+
+	// CAGR only makes sense for annual or same-quarter-across-years data.
+	numYears := float64(data[len(data)-1].FiscalYear - data[0].FiscalYear)
+	if numYears > 0 && startVal > 0 && endVal > 0 {
+		cagr := (math.Pow(endVal/startVal, 1.0/numYears) - 1) * 100
+		analysis["cagr_percent"] = math.Round(cagr*100) / 100
+	}
+
+	return analysis
+}
+
+// deriveQuarterlyData collects standalone quarterly data (≤95 days) and derives
+// Q4 values from annual totals when not reported standalone (Q4 = FY - Q1 - Q2 - Q3).
+// If filterQuarter is set (e.g. "Q4"), only that quarter is returned.
+// If filterQuarter is empty, all quarters are returned.
+func deriveQuarterlyData(ns map[string]edgar.FactData, metric string, startYear, endYear int, filterQuarter string) []periodDataPoint {
+	// Get standalone quarterly data.
+	qData := collectMetricData(ns, metric, []string{"10-Q", "10-K"}, startYear, endYear, "", true)
+	// Get annual totals.
+	fyData := collectMetricData(ns, metric, []string{"10-K"}, startYear, endYear, "FY")
+
+	// Index quarterly data by year → quarter.
+	byYear := make(map[int]map[string]*periodDataPoint)
+	for i := range qData {
+		dp := &qData[i]
+		if dp.FiscalPeriod != "Q1" && dp.FiscalPeriod != "Q2" && dp.FiscalPeriod != "Q3" && dp.FiscalPeriod != "Q4" {
+			continue
+		}
+		if byYear[dp.FiscalYear] == nil {
+			byYear[dp.FiscalYear] = make(map[string]*periodDataPoint)
+		}
+		byYear[dp.FiscalYear][dp.FiscalPeriod] = dp
+	}
+
+	// Derive Q4 where missing.
+	for _, fy := range fyData {
+		qMap := byYear[fy.FiscalYear]
+		if qMap == nil {
+			continue
+		}
+		if _, hasQ4 := qMap["Q4"]; hasQ4 {
+			continue
+		}
+		q1, hasQ1 := qMap["Q1"]
+		q2, hasQ2 := qMap["Q2"]
+		q3, hasQ3 := qMap["Q3"]
+		if hasQ1 && hasQ2 && hasQ3 {
+			qMap["Q4"] = &periodDataPoint{
+				FiscalYear:   fy.FiscalYear,
+				FiscalPeriod: "Q4",
+				Value:        fy.Value - q1.Value - q2.Value - q3.Value,
+				EndDate:      "derived",
+				Form:         "derived",
+			}
+		}
+	}
+
+	// Collect results.
+	var result []periodDataPoint
+	for _, qMap := range byYear {
+		for _, dp := range qMap {
+			if filterQuarter != "" && dp.FiscalPeriod != filterQuarter {
+				continue
+			}
+			result = append(result, *dp)
+		}
+	}
+	return result
+}
+
 func comparePeriods(client *edgar.Client) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		identifier, _ := req.RequireString("identifier")
 		metric, _ := req.RequireString("metric")
 		startYear := req.GetInt("start_year", 2020)
 		endYear := req.GetInt("end_year", 2024)
+		period := req.GetString("period", "annual")
+		quarter := strings.ToUpper(req.GetString("quarter", ""))
 
 		cik, err := client.ResolveCIK(identifier)
 		if err != nil {
@@ -324,85 +528,218 @@ func comparePeriods(client *edgar.Client) server.ToolHandlerFunc {
 			return errorResult(fmt.Sprintf("Failed to get company facts: %v", err)), nil
 		}
 
-		// Resolve concept alternatives so revenue aliases etc. are all checked.
 		ns, ok := facts.Facts["us-gaap"]
 		if !ok {
 			return errorResult("No us-gaap data available"), nil
 		}
 
-		alts := resolveConceptAlternatives(metric)
+		var data []periodDataPoint
+		var mode string
 
-		// Collect annual (10-K) data points within the year range across all alternatives.
-		type yearData struct {
-			Year  int     `json:"fiscal_year"`
-			Value float64 `json:"value"`
-			End   string  `json:"end_date"`
-			Form  string  `json:"form"`
-		}
-		yearMap := make(map[int]*yearData)
-
-		for _, alt := range alts {
-			fd, ok := ns[alt]
-			if !ok {
-				continue
+		switch period {
+		case "quarterly":
+			// Same quarter compared YoY (e.g. Q4 2022 vs Q4 2023 vs Q4 2024).
+			if quarter == "" {
+				return errorResult("'quarter' parameter is required for quarterly mode (Q1, Q2, Q3, or Q4)"), nil
 			}
-			for _, points := range fd.Units {
-				for _, p := range points {
-					if p.Form != "10-K" {
-						continue
-					}
-					if p.FY >= startYear && p.FY <= endYear {
-						if existing, ok := yearMap[p.FY]; !ok || p.End > existing.End {
-							yearMap[p.FY] = &yearData{
-								Year:  p.FY,
-								Value: p.Val,
-								End:   p.End,
-								Form:  p.Form,
-							}
-						}
-					}
-				}
+			if quarter != "Q1" && quarter != "Q2" && quarter != "Q3" && quarter != "Q4" {
+				return errorResult(fmt.Sprintf("Invalid quarter %q — must be Q1, Q2, Q3, or Q4", quarter)), nil
 			}
-		}
 
-		if len(yearMap) == 0 {
-			return errorResult(fmt.Sprintf("Metric %q (and alternatives %v) not found in 10-K filings for the given year range", metric, alts)), nil
-		}
-
-		periodData := make([]yearData, 0, len(yearMap))
-		for _, yd := range yearMap {
-			periodData = append(periodData, *yd)
-		}
-		sort.Slice(periodData, func(i, j int) bool {
-			return periodData[i].Year < periodData[j].Year
-		})
-
-		// Calculate analysis.
-		analysis := map[string]any{}
-		if len(periodData) >= 2 {
-			startVal := periodData[0].Value
-			endVal := periodData[len(periodData)-1].Value
-			if startVal != 0 {
-				totalGrowth := (endVal - startVal) / math.Abs(startVal) * 100
-				analysis["total_growth_percent"] = math.Round(totalGrowth*100) / 100
-				analysis["start_value"] = startVal
-				analysis["end_value"] = endVal
-
-				numYears := float64(periodData[len(periodData)-1].Year - periodData[0].Year)
-				if numYears > 0 && startVal > 0 && endVal > 0 {
-					cagr := (math.Pow(endVal/startVal, 1.0/numYears) - 1) * 100
-					analysis["cagr_percent"] = math.Round(cagr*100) / 100
-				}
+			if quarter == "Q4" {
+				// Q4 is often not reported standalone — derive from annual - (Q1+Q2+Q3).
+				data = deriveQuarterlyData(ns, metric, startYear, endYear, "Q4")
+			} else {
+				data = collectMetricData(ns, metric, []string{"10-Q", "10-K"}, startYear, endYear, quarter, true)
 			}
+			mode = fmt.Sprintf("quarterly_yoy_%s", quarter)
+
+		case "sequential":
+			// Consecutive quarters within the year range (Q1→Q2→Q3→Q4→Q1...).
+			data = deriveQuarterlyData(ns, metric, startYear, endYear, "")
+			mode = "sequential_quarters"
+
+		default: // "annual"
+			data = collectMetricData(ns, metric, []string{"10-K"}, startYear, endYear, "FY")
+			mode = "annual_yoy"
 		}
+
+		if len(data) == 0 {
+			alts := resolveConceptAlternatives(metric)
+			return errorResult(fmt.Sprintf("Metric %q (and alternatives %v) not found for the given parameters", metric, alts)), nil
+		}
+
+		sortPeriodData(data)
+		analysis := computeGrowthAnalysis(data)
 
 		return jsonResult(map[string]any{
 			"success":     true,
 			"cik":         cik,
 			"name":        facts.EntityName,
 			"metric":      metric,
-			"period_data": periodData,
+			"mode":        mode,
+			"period_data": data,
 			"analysis":    analysis,
+		})
+	}
+}
+
+func getQuarterlyDistribution(client *edgar.Client) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		identifier, _ := req.RequireString("identifier")
+		yearsStr, _ := req.RequireString("years")
+		metricsStr := req.GetString("metrics", "")
+
+		// Parse years.
+		var years []int
+		for _, s := range strings.Split(yearsStr, ",") {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			var y int
+			if _, err := fmt.Sscanf(s, "%d", &y); err == nil {
+				years = append(years, y)
+			}
+		}
+		if len(years) == 0 {
+			return errorResult("No valid years provided. Use comma-separated years like '2023,2024,2025'"), nil
+		}
+		sort.Ints(years)
+
+		// Parse metrics — default to revenue.
+		var metrics []string
+		if metricsStr != "" {
+			for _, s := range strings.Split(metricsStr, ",") {
+				s = strings.TrimSpace(s)
+				if s != "" {
+					metrics = append(metrics, s)
+				}
+			}
+		} else {
+			metrics = []string{"RevenueFromContractWithCustomerExcludingAssessedTax"}
+		}
+
+		cik, err := client.ResolveCIK(identifier)
+		if err != nil {
+			return errorResult(fmt.Sprintf("Failed to resolve identifier: %v", err)), nil
+		}
+
+		facts, err := client.GetCompanyFacts(cik)
+		if err != nil {
+			return errorResult(fmt.Sprintf("Failed to get company facts: %v", err)), nil
+		}
+
+		ns, ok := facts.Facts["us-gaap"]
+		if !ok {
+			return errorResult("No us-gaap data available"), nil
+		}
+
+		yearSet := make(map[int]bool, len(years))
+		for _, y := range years {
+			yearSet[y] = true
+		}
+		minYear, maxYear := years[0], years[len(years)-1]
+
+		type quarterEntry struct {
+			Quarter     string  `json:"quarter"`
+			Value       float64 `json:"value"`
+			EndDate     string  `json:"end_date"`
+			ShareOfYear float64 `json:"share_of_year_percent"`
+		}
+		type yearBreakdown struct {
+			FiscalYear  int            `json:"fiscal_year"`
+			AnnualTotal float64        `json:"annual_total"`
+			Quarters    []quarterEntry `json:"quarters"`
+		}
+		type metricDistribution struct {
+			Metric string          `json:"metric"`
+			Years  []yearBreakdown `json:"years"`
+		}
+
+		results := make([]metricDistribution, 0, len(metrics))
+
+		for _, metric := range metrics {
+			data := deriveQuarterlyData(ns, metric, minYear, maxYear, "")
+			annualData := collectMetricData(ns, metric, []string{"10-K"}, minYear, maxYear, "FY")
+
+			annualByYear := make(map[int]float64)
+			for _, dp := range annualData {
+				annualByYear[dp.FiscalYear] = dp.Value
+			}
+
+			// Organize by year → quarter.
+			yearQuarters := make(map[int]map[string]*periodDataPoint)
+			for i := range data {
+				dp := &data[i]
+				if !yearSet[dp.FiscalYear] {
+					continue
+				}
+				if yearQuarters[dp.FiscalYear] == nil {
+					yearQuarters[dp.FiscalYear] = make(map[string]*periodDataPoint)
+				}
+				yearQuarters[dp.FiscalYear][dp.FiscalPeriod] = dp
+			}
+
+			if len(yearQuarters) == 0 {
+				continue
+			}
+
+			yearBreakdowns := make([]yearBreakdown, 0, len(years))
+			for _, y := range years {
+				qMap := yearQuarters[y]
+				if qMap == nil || len(qMap) == 0 {
+					continue
+				}
+
+				// Use annual total if available, otherwise sum quarters.
+				annualTotal, hasAnnual := annualByYear[y]
+				if !hasAnnual {
+					for _, dp := range qMap {
+						annualTotal += dp.Value
+					}
+				}
+
+				quarters := make([]quarterEntry, 0, 4)
+				for _, q := range []string{"Q1", "Q2", "Q3", "Q4"} {
+					dp, ok := qMap[q]
+					if !ok {
+						continue
+					}
+					share := 0.0
+					if annualTotal > 0 {
+						share = math.Round(dp.Value/annualTotal*10000) / 100
+					}
+					quarters = append(quarters, quarterEntry{
+						Quarter:     q,
+						Value:       dp.Value,
+						EndDate:     dp.EndDate,
+						ShareOfYear: share,
+					})
+				}
+
+				yearBreakdowns = append(yearBreakdowns, yearBreakdown{
+					FiscalYear:  y,
+					AnnualTotal: annualTotal,
+					Quarters:    quarters,
+				})
+			}
+
+			results = append(results, metricDistribution{
+				Metric: metric,
+				Years:  yearBreakdowns,
+			})
+		}
+
+		if len(results) == 0 {
+			return errorResult("No quarterly data found for the requested metrics and years"), nil
+		}
+
+		return jsonResult(map[string]any{
+			"success":       true,
+			"cik":           cik,
+			"name":          facts.EntityName,
+			"distributions": results,
 		})
 	}
 }
