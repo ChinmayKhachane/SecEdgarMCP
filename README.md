@@ -1,6 +1,6 @@
 # SEC EDGAR MCP Server
 
-An MCP server for querying SEC EDGAR financial data — company info, financial statements, XBRL metrics, filings, insider trading, and more. Built in Go with [mcp-go](https://github.com/mark3labs/mcp-go).
+An MCP server for querying SEC EDGAR financial data — company info, financial statements, XBRL metrics, filings, insider trading, and more. Built with go
 
 ## Prerequisites
 
