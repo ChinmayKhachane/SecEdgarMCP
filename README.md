@@ -5,11 +5,10 @@ An MCP server for querying SEC EDGAR financial data — company info, financial 
 ## Prerequisites
 
 - Docker (recommended) **or** Go 1.26+
-- A SEC EDGAR user agent string (required by [SEC's fair access policy](https://www.sec.gov/os/accessing-edgar-data))
 
 ## Getting Started
 
-### Option A: Docker (Recommended)
+### Option A: Docker 
 
 #### 1. Clone the repo
 
@@ -26,7 +25,7 @@ cd SecEdgarMCP
 
 #### 3. Configure Claude Code
 
-Add to your `.mcp.json` (project-level) or `~/.claude/settings.json` (global):
+Add to your `.mcp.json`
 
 ```json
 {
