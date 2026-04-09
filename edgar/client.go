@@ -295,6 +295,23 @@ func (c *Client) GetRecentFilings(cik string, formType string, days int, limit i
 	return results, nil
 }
 
+// GetLatestFiling returns the single most recent filing of a specific form type.
+// Unlike GetRecentFilings (which is bounded by a day window), this scans the
+// full submissions feed so the latest 10-K, 10-Q, etc. is always returned even
+// if it was filed long ago.
+func (c *Client) GetLatestFiling(cik, formType string) (*FilingInfo, error) {
+	// 100 years back is effectively unbounded — the SEC submissions feed itself
+	// is the limiting factor.
+	results, err := c.GetRecentFilings(cik, formType, 365*100, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, fmt.Errorf("no %s filing found for CIK %s", formType, cik)
+	}
+	return &results[0], nil
+}
+
 // GetFilingContent fetches the text content of a filing document.
 func (c *Client) GetFilingContent(cik, accessionNumber string) (string, string, error) {
 	cik = PadCIK(cik)
@@ -349,6 +366,14 @@ func (c *Client) GetFilingContent(cik, accessionNumber string) (string, string, 
 	}
 
 	return string(content), formType, nil
+}
+
+// FetchFilingDocument fetches a document from the EDGAR archive by URL,
+// using the EDGAR-required User-Agent header. The caller is responsible for
+// supplying a complete primary-document URL (e.g. the SECURL returned by
+// GetRecentFilings / GetLatestFiling).
+func (c *Client) FetchFilingDocument(docURL string) ([]byte, error) {
+	return c.getHTML(docURL)
 }
 
 // BuildSECURL builds a URL to a filing on the SEC website.

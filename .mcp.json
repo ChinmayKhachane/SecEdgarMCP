@@ -5,6 +5,12 @@
       "args": ["run", "--rm", "-i", "--platform", "linux/amd64",
                "-e", "SEC_EDGAR_USER_AGENT=Chinmay LastName (your@email.com)",
                "sec-edgar-mcp:latest"]
+    },
+    "sec-edgar-local": {
+      "command": "/home/chinmay/projects/secEdgarMCP/sec-edgar-mcp",
+      "env": {
+        "SEC_EDGAR_USER_AGENT": "Chinmay LastName (your@email.com)"
+      }
     }
   }
 }
